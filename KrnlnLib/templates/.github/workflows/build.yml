@@ -1,0 +1,99 @@
+name: Cross-platform Qt build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: ubuntu-latest
+          - os: macos-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 安装 Qt — version: '6.*' 自动获取最新 Qt6（目前 6.10.x）
+      # CI 使用动态库（官方预构建包），本地可用静态库单文件发布
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.*'
+          modules: 'qtcharts qtmultimedia qtnetworkauth qtserialport qtsensors qtwebsockets'
+          cache: true
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxrender-dev \
+            libxcb1-dev \
+            libxcb-cursor-dev \
+            libxcb-glx0-dev \
+            libxcb-keysyms1-dev \
+            libxcb-image0-dev \
+            libxcb-shm0-dev \
+            libxcb-icccm4-dev \
+            libxcb-sync-dev \
+            libxcb-xfixes0-dev \
+            libxcb-shape0-dev \
+            libxcb-randr0-dev \
+            libxcb-render-util0-dev \
+            libxcb-util-dev \
+            libxcb-xinerama0-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-x11-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # === 打包阶段（动态库部署，CI 产物可直接运行）===
+
+      - name: Deploy Qt (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build/Release -Filter *.exe | Select-Object -First 1
+          if ($exe) { windeployqt $exe.FullName }
+
+      - name: Deploy Qt (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          app=$(find build -name "*.app" | head -1)
+          if [ -n "$app" ]; then macdeployqt "$app"; fi
+
+      # Linux 暂无官方一键部署工具，产物仍需用户安装 Qt 运行时
+      # 或使用 linuxdeployqt / AppImage 方案
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}
+          path: |
+            build/Release/
+            build/release/
+            build/*.app
+          if-no-files-found: ignore
+          retention-days: 7
