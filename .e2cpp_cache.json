@@ -1,0 +1,14 @@
+﻿{
+    "files": {
+        "程序集.static.e.txt": {
+            "combinedHash": "54dc962161d9e78cd8061960edae5d9e75b097c46eff4ea40a2df2e980ed63c0",
+            "outputs": [
+                "代码/程序集.static.h",
+                "代码/程序集.static.cpp"
+            ],
+            "sourceHash": "55fd3fc21fa2bd2bb5bfc23d9e344fafac0de4055ea948c561c390595fa4394d"
+        }
+    },
+    "projectContextHash": "e111d4544e80532b27b8229f0a79d3e810828477153c9ad532bad9c720acae96",
+    "version": "e2cpp-cache-v1"
+}

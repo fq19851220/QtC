@@ -1,0 +1,725 @@
+name: Cross-platform Qt build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+          - os: ubuntu-22.04
+            target: linux
+          - os: macos-latest
+            target: macos
+          - os: ubuntu-22.04
+            target: android
+
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_VERSION: '6.10.*'
+      QT_MODULES: 'qthttpserver qtmultimedia qtnetworkauth qtwebsockets'
+      BUILD_CONFIG: 'Release'
+      PACKAGE_MODE: 'full'
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Java 17 for Android
+        if: matrix.target == 'android'
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/pip
+            ~/Library/Caches/pip
+            ~/AppData/Local/pip/Cache
+          key: pip-${{ runner.os }}-py312-aqt-v1
+
+      - name: Cache Qt installation
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/Qt
+          key: qt-${{ runner.os }}-${{ matrix.target }}-${{ env.QT_VERSION }}-${{ env.QT_MODULES }}-v1
+
+      - name: Install aqtinstall
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade aqtinstall
+
+      - name: Install Qt with aqtinstall
+        shell: pwsh
+        run: |
+          $qtBase = Join-Path $env:RUNNER_TEMP 'Qt'
+          New-Item -ItemType Directory -Force -Path $qtBase | Out-Null
+          if ('${{ matrix.target }}' -eq 'android') {
+            $settingsPath = Get-ChildItem -Path . -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('_eqt_project_settings.json', '_eqt_project_settings.json.txt') } | Select-Object -First 1
+            $selectedAbis = @('arm64-v8a')
+            $supportedAbis = @('arm64-v8a', 'x86_64')
+            if ($settingsPath) {
+              try {
+                $settings = Get-Content -LiteralPath $settingsPath.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+                $abis = @()
+                if ($settings.android -and $settings.android.general) {
+                  if ($settings.android.general.abis) {
+                    $abis = @($settings.android.general.abis | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ })
+                  }
+                  if (-not $abis -and $settings.android.general.abi) {
+                    $legacyAbi = $settings.android.general.abi.ToString().Trim()
+                    if ($legacyAbi) { $abis = @($legacyAbi) }
+                  }
+                }
+                if ($abis) { $selectedAbis = @($abis | Where-Object { $_ -in $supportedAbis }) }
+              } catch {
+                Write-Host "Failed to parse Android ABI settings: $($_.Exception.Message)"
+              }
+            }
+            if (-not $selectedAbis) { $selectedAbis = @('arm64-v8a') }
+            $primaryAbi = $selectedAbis[0]
+            $abiMap = @{
+              'arm64-v8a'   = 'android_arm64_v8a'
+              'x86_64'      = 'android_x86_64'
+            }
+            $hostRoot = Get-ChildItem -Path $qtBase -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'gcc_64' } | Select-Object -First 1
+            $androidQtVersion = $env:QT_VERSION
+            if ($androidQtVersion -match '^\d+\.\d+\.\*$') {
+              $androidQtVersion = $androidQtVersion -replace '\.\*$', '.0'
+            }
+            Write-Host "Android Qt version spec: $androidQtVersion"
+            Write-Host "Selected Android ABIs: $($selectedAbis -join ', ')"
+            if (-not $hostRoot) {
+              python -m aqt install-qt --outputdir $qtBase linux desktop $androidQtVersion linux_gcc_64
+              $hostRoot = Get-ChildItem -Path $qtBase -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'gcc_64' } | Select-Object -First 1
+            }
+            foreach ($abi in $selectedAbis) {
+              $aqtArch = $abiMap[$abi]
+              if (-not $aqtArch) { throw "Unsupported Android ABI: $abi" }
+              $androidRoot = Get-ChildItem -Path $qtBase -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $aqtArch } | Select-Object -First 1
+              if ($androidRoot) {
+                Write-Host "Using cached Qt for Android ABI $abi at $($androidRoot.FullName)"
+                continue
+              }
+              Write-Host "Installing Qt for Android ABI $abi ($aqtArch)..."
+              $androidArgs = @('install-qt', '--outputdir', $qtBase, 'linux', 'android', $androidQtVersion, $aqtArch)
+              if (-not [string]::IsNullOrWhiteSpace($env:QT_MODULES)) {
+                $androidArgs += '--modules'
+                $androidArgs += ($env:QT_MODULES -split ' ' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              }
+              python -m aqt @androidArgs
+            }
+            foreach ($abi in $selectedAbis) {
+              $aqtArch = $abiMap[$abi]
+              $androidRoot = Get-ChildItem -Path $qtBase -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $aqtArch } | Select-Object -First 1
+              if (-not $androidRoot) { throw "Qt root for Android ABI $abi not found after installation." }
+              $envKey = ('QT_ROOT_ANDROID_' + ($abi.ToUpper().Replace('-', '_')))
+              "$envKey=$($androidRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+            $primaryAqtArch = $abiMap[$primaryAbi]
+            $androidRoot = Get-ChildItem -Path $qtBase -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $primaryAqtArch } | Select-Object -First 1
+            if (-not $hostRoot -or -not $androidRoot) { throw 'Android Qt host/target installation incomplete.' }
+            "QT_HOST_PATH=$($hostRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "QT_ROOT=$($androidRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            (Join-Path $hostRoot.FullName 'bin') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "Installed Android Qt to $($androidRoot.FullName) with host tools at $($hostRoot.FullName)"
+          } elseif ($env:RUNNER_OS -eq 'Windows') {
+            $hostOs = 'windows'
+            $target = 'desktop'
+            $arch = 'win64_msvc2022_64'
+          } elseif ($env:RUNNER_OS -eq 'macOS') {
+            $hostOs = 'mac'
+            $target = 'desktop'
+            $arch = 'clang_64'
+          } else {
+            $hostOs = 'linux'
+            $target = 'desktop'
+            $arch = 'linux_gcc_64'
+          }
+          if ('${{ matrix.target }}' -ne 'android') {
+            $qmake = Get-ChildItem -Path $qtBase -Recurse -File | Where-Object { $_.Name -in @('qmake', 'qmake.exe', 'qmake6', 'qmake6.exe') } | Select-Object -First 1
+            if (-not $qmake) {
+              $args = @('install-qt', '--outputdir', $qtBase, $hostOs, $target, $env:QT_VERSION, $arch)
+              if (-not [string]::IsNullOrWhiteSpace($env:QT_MODULES)) {
+                $args += '--modules'
+                $args += ($env:QT_MODULES -split ' ' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              }
+              python -m aqt @args
+              $qmake = Get-ChildItem -Path $qtBase -Recurse -File | Where-Object { $_.Name -in @('qmake', 'qmake.exe', 'qmake6', 'qmake6.exe') } | Select-Object -First 1
+            } else {
+              Write-Host 'Using cached Qt installation.'
+            }
+            if (-not $qmake) { throw 'qmake not found after Qt installation.' }
+            $qtRoot = Split-Path -Parent $qmake.FullName
+            $qtRoot = Split-Path -Parent $qtRoot
+            "QT_ROOT=$qtRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "CMAKE_PREFIX_PATH=$qtRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            $qmakeDir = Split-Path -Parent $qmake.FullName
+            $qmakeDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "Installed Qt to $qtRoot"
+          }
+
+      - name: Prepare Android toolchain
+        if: matrix.target == 'android'
+        shell: bash
+        run: |
+          if [ -z "$ANDROID_HOME" ]; then
+            echo 'ANDROID_HOME is not set on this runner.'
+            exit 1
+          fi
+          SDKMANAGER=""
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          elif [ -x "$ANDROID_HOME/cmdline-tools/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/bin/sdkmanager"
+          else
+            SDKMANAGER=$(find "$ANDROID_HOME" -path '*/cmdline-tools/*/bin/sdkmanager' | head -1)
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            echo 'sdkmanager not found under ANDROID_HOME.'
+            find "$ANDROID_HOME" -maxdepth 4 -type f | sed -n '1,80p'
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Load Android project settings
+        if: matrix.target == 'android'
+        shell: bash
+        run: |
+          SETTINGS=$(find . -maxdepth 4 \( -name '_eqt_project_settings.json' -o -name '_eqt_project_settings.json.txt' \) | head -1)
+          if [ -z "$SETTINGS" ]; then
+            echo 'No _eqt_project_settings.json found, using Android defaults.'
+            {
+              echo 'EQT_ANDROID_PACKAGE_SOURCE_DIR=android'
+              echo 'EQT_ANDROID_MIN_SDK=28'
+              echo 'EQT_ANDROID_TARGET_SDK=35'
+              echo 'EQT_ANDROID_ABIS=arm64-v8a'
+              echo 'EQT_ANDROID_SIGN_MODE=debug'
+              echo 'EQT_ANDROID_PACKAGE_NAME='
+              echo 'EQT_ANDROID_ACTIVITY_NAME='
+            } >> "$GITHUB_ENV"
+          else
+            python -c "import json,pathlib,sys; settings_path=pathlib.Path(sys.argv[1]); github_env=pathlib.Path(sys.argv[2]); data=json.loads(settings_path.read_text(encoding='utf-8')); android=data.get('android', {}); general=android.get('general', {}); signing=android.get('signing', {}); min_sdk=max(28, int(general.get('minSdk', 28) or 28)); target_sdk=max(min_sdk, int(general.get('targetSdk', 35) or 35)); supported={'arm64-v8a','x86_64'}; abis=general.get('abis') or []; abis=[str(x).strip() for x in abis if str(x).strip() in supported]; legacy_abi=str(general.get('abi', '') or '').strip(); abis=abis or ([legacy_abi] if legacy_abi in supported else ['arm64-v8a']); package_name=str(general.get('applicationId', '') or general.get('packageName', '') or ''); values={'EQT_ANDROID_PACKAGE_SOURCE_DIR': str(general.get('packageSourceDir', 'android') or 'android'),'EQT_ANDROID_MIN_SDK': str(min_sdk),'EQT_ANDROID_TARGET_SDK': str(target_sdk),'EQT_ANDROID_ABIS': ';'.join(abis),'EQT_ANDROID_PRIMARY_ABI': abis[0],'EQT_ANDROID_SIGN_MODE': str(signing.get('mode', 'debug') or 'debug'),'EQT_ANDROID_KEYSTORE': str(signing.get('keystorePath', '') or ''),'EQT_ANDROID_KEY_ALIAS': str(signing.get('keyAlias', '') or ''),'EQT_ANDROID_STORE_PASSWORD': str(signing.get('storePassword', '') or ''),'EQT_ANDROID_KEY_PASSWORD': str(signing.get('keyPassword', '') or ''),'EQT_ANDROID_PACKAGE_NAME': package_name,'EQT_ANDROID_ACTIVITY_NAME': str(general.get('activityName', '') or '')}; github_env.open('a', encoding='utf-8').write(''.join(f'{k}={v}\n' for k, v in values.items()))" "$SETTINGS" "$GITHUB_ENV"
+          fi
+
+      - name: Install Linux system dependencies
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev \
+            libxi-dev libxrender-dev \
+            libxcb1-dev libxcb-cursor-dev libxcb-glx0-dev \
+            libxcb-keysyms1-dev libxcb-image0-dev libxcb-shm0-dev \
+            libxcb-icccm4-dev libxcb-sync-dev libxcb-xfixes0-dev \
+            libxcb-shape0-dev libxcb-randr0-dev \
+            libxcb-render-util0-dev libxcb-util-dev \
+            libxcb-xinerama0-dev libxcb-xkb-dev
+
+      - name: Load macOS project settings
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          SETTINGS=$(find . -maxdepth 4 \( -name '_eqt_project_settings.json' -o -name '_eqt_project_settings.json.txt' \) | head -1)
+          if [ -z "$SETTINGS" ]; then
+            echo 'No _eqt_project_settings.json found, using macOS defaults.'
+            {
+              echo 'EQT_MACOS_BUNDLE_ID=com.eqt.app'
+              echo 'EQT_MACOS_APP_NAME=EQtApp'
+              echo 'EQT_MACOS_VERSION_NAME=1.0.0'
+              echo 'EQT_MACOS_VERSION_CODE=1'
+              echo 'EQT_MACOS_TARGET=13'
+              echo 'EQT_MACOS_ARCH=arm64'
+            } >> "$GITHUB_ENV"
+          else
+            python -c "import json,pathlib,sys; settings_path=pathlib.Path(sys.argv[1]); github_env=pathlib.Path(sys.argv[2]); data=json.loads(settings_path.read_text(encoding='utf-8')); macos=data.get('macos', {}); general=macos.get('general', {}); values={'EQT_MACOS_BUNDLE_ID': str(general.get('bundleId', 'com.eqt.app') or 'com.eqt.app'),'EQT_MACOS_APP_NAME': str(general.get('appName', 'EQtApp') or 'EQtApp'),'EQT_MACOS_VERSION_NAME': str(general.get('versionName', '1.0.0') or '1.0.0'),'EQT_MACOS_VERSION_CODE': str(general.get('versionCode', 1) or 1),'EQT_MACOS_TARGET': str(general.get('target', 13) or 13),'EQT_MACOS_ARCH': str(general.get('arch', 'arm64') or 'arm64')}; github_env.open('a', encoding='utf-8').write(''.join(f'{k}={v}\n' for k, v in values.items()))" "$SETTINGS" "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        shell: bash
+        run: |
+          echo '=== Repo root ===' && ls -la
+          SRC=$(find . -maxdepth 3 -name CMakeLists.txt -not -path '*/KrnlnLib/*' -not -path '*/3rd/*' | head -1)
+          if [ -z "$SRC" ]; then echo 'ERROR: CMakeLists.txt not found'; ls -laR; exit 1; fi
+          SRC=$(dirname "$SRC")
+          echo "CMakeLists.txt found in: $SRC"
+          if [ "${{ matrix.target }}" = "windows" ]; then
+            cmake -S "$SRC" -B build -G "Visual Studio 17 2022" -A x64 \
+              -DCMAKE_CONFIGURATION_TYPES="Debug;Release" \
+              -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+          elif [ "${{ matrix.target }}" = "android" ]; then
+            selected_abis="${EQT_ANDROID_ABIS:-${EQT_ANDROID_PRIMARY_ABI:-arm64-v8a}}"
+            mapfile -t abi_list < <(python -c "import sys; raw=sys.argv[1]; items=[x.strip() for x in raw.split(';') if x.strip()]; print('\n'.join(items or ['arm64-v8a']))" "$selected_abis")
+            rm -rf build/android_abi_builds
+            mkdir -p build/android_abi_builds
+            for abi in "${abi_list[@]}"; do
+              abi_env=$(echo "$abi" | tr '[:lower:]-' '[:upper:]_')
+              qt_root_var="QT_ROOT_ANDROID_${abi_env}"
+              qt_root="${!qt_root_var:-}"
+              if [ -z "$qt_root" ]; then
+                echo "ERROR: Qt root env not found for ABI $abi ($qt_root_var)"
+                exit 1
+              fi
+              build_dir="build/android_abi_builds/$abi"
+              "$qt_root/bin/qt-cmake" -S "$SRC" -B "$build_dir" \
+                -DCMAKE_BUILD_TYPE="$BUILD_CONFIG" \
+                -DANDROID_ABI="$abi" \
+                -DANDROID_PLATFORM="android-${EQT_ANDROID_MIN_SDK:-28}" \
+                -DQT_HOST_PATH="$QT_HOST_PATH" \
+                -DANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" \
+                -DANDROID_NDK_ROOT="$ANDROID_NDK_ROOT"
+            done
+          elif [ "${{ matrix.target }}" = "macos" ]; then
+            cmake -S "$SRC" -B build -DCMAKE_BUILD_TYPE="$BUILD_CONFIG" -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="${EQT_MACOS_TARGET:-13}" \
+              -DCMAKE_OSX_ARCHITECTURES="${EQT_MACOS_ARCH:-arm64}"
+          else
+            cmake -S "$SRC" -B build -DCMAKE_BUILD_TYPE="$BUILD_CONFIG" -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "android" ]; then
+            selected_abis="${EQT_ANDROID_ABIS:-${EQT_ANDROID_PRIMARY_ABI:-arm64-v8a}}"
+            mapfile -t abi_list < <(python -c "import sys; raw=sys.argv[1]; items=[x.strip() for x in raw.split(';') if x.strip()]; print('\n'.join(items or ['arm64-v8a']))" "$selected_abis")
+            for abi in "${abi_list[@]}"; do
+              cmake --build "build/android_abi_builds/$abi" --config "$BUILD_CONFIG" --parallel
+            done
+          else
+            cmake --build build --config "$BUILD_CONFIG" --parallel
+          fi
+
+      - name: Debug Android build outputs
+        if: matrix.target == 'android'
+        shell: bash
+        run: |
+          set +e
+          echo '=== Build directory structure ==='
+          find build -maxdepth 4 -type f -name '*.so' 2>/dev/null | head -20 || true
+          echo '=== All .so files anywhere in build ==='
+          find build -type f -name '*.so*' 2>/dev/null | head -30 || true
+          echo '=== CMake target name from CMakeLists.txt ==='
+          grep -E '(qt_add_executable|add_library)' $(find . -maxdepth 2 -name CMakeLists.txt | head -1) 2>/dev/null || true
+          echo '=== Deployment settings ==='
+          find . -name '*deployment-settings*.json' -exec cat {} \; 2>/dev/null | head -80 || true
+          echo '=== Candidate Android shared libraries ==='
+          find build -type f \( -name '*.so' -o -name 'lib*.so' \) 2>/dev/null | head -40 || true
+          echo '=== Copy all ABI .so files to deploy directory ==='
+          # Find all libmain_<abi>.so files and copy to correct location
+          for so_file in $(find build -type f -name 'libmain_*.so' 2>/dev/null); do
+            # Extract ABI from filename like libmain_arm64-v8a.so -> arm64-v8a
+            abi=$(basename "$so_file" .so | sed 's/libmain_//')
+            [ -z "$abi" ] && continue
+            mkdir -p deploy/android-build/libs/$abi
+            echo "Copying $so_file -> deploy/android-build/libs/$abi/"
+            cp -v "$so_file" deploy/android-build/libs/$abi/ 2>/dev/null || true
+          done
+          echo '=== deploy/android-build/libs contents after copy ==='
+          find deploy/android-build/libs -type f 2>/dev/null | head -20 || echo 'No .so files copied yet'
+          exit 0
+
+      - name: Inspect Windows binary configuration
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          $candidateDirs = @(
+            (Join-Path (Join-Path 'build' 'out') $env:BUILD_CONFIG),
+            (Join-Path 'build' $env:BUILD_CONFIG),
+            (Join-Path (Join-Path 'build' 'x64') $env:BUILD_CONFIG),
+            (Join-Path (Join-Path 'build' 'bin') $env:BUILD_CONFIG)
+          ) | Where-Object { Test-Path $_ }
+          if (-not $candidateDirs) {
+            $candidateDirs = Get-ChildItem -Path build -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq $env:BUILD_CONFIG } |
+              Select-Object -ExpandProperty FullName
+          }
+          if (-not $candidateDirs) {
+            Write-Host 'Available build directories:'
+            Get-ChildItem build -Directory -Recurse -ErrorAction SilentlyContinue | Select-Object FullName | Format-Table -AutoSize
+            throw "Expected Windows output directory for BUILD_CONFIG=$env:BUILD_CONFIG not found."
+          }
+          $winBuildDir = $candidateDirs | Select-Object -First 1
+          Write-Host "BUILD_CONFIG=$env:BUILD_CONFIG"
+          Write-Host "Inspecting binaries under: $winBuildDir"
+          Get-ChildItem -Recurse $winBuildDir -Filter *.exe |
+            Where-Object {
+              $_.FullName -notmatch '[\\/]CMakeFiles[\\/]' -and
+              $_.DirectoryName -notmatch 'CompilerId' -and
+              $_.BaseName -notlike 'CompilerId*'
+            } |
+            Select-Object FullName, Length | Format-Table -AutoSize
+          $exe = Get-ChildItem -Recurse $winBuildDir -Filter *.exe |
+            Where-Object {
+              $_.FullName -notmatch '[\\/]CMakeFiles[\\/]' -and
+              $_.DirectoryName -notmatch 'CompilerId' -and
+              $_.BaseName -notlike 'CompilerId*'
+            } |
+            Sort-Object FullName |
+            Select-Object -First 1
+          if (-not $exe) { throw 'No application executable found after build.' }
+          if ($exe.FullName -notmatch ([regex]::Escape([IO.Path]::DirectorySeparatorChar + $env:BUILD_CONFIG + [IO.Path]::DirectorySeparatorChar))) {
+            throw "Selected executable does not belong to BUILD_CONFIG=$env:BUILD_CONFIG: $($exe.FullName)"
+          }
+          Write-Host "Selected executable: $($exe.FullName)"
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          if ($dumpbin) {
+            $deps = & $dumpbin.Source /DEPENDENTS $exe.FullName | Out-String
+            Write-Host $deps
+            if ($env:BUILD_CONFIG -eq 'Release' -and $deps -match 'Qt6[A-Za-z0-9_]*d\.dll') {
+              throw 'Release build still depends on debug Qt DLLs.'
+            }
+          } else {
+            Write-Host 'dumpbin.exe not found; skipping dependency inspection.'
+          }
+
+      - name: Deploy Qt (Windows)
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          if ($env:PACKAGE_MODE -ne 'full') { Write-Host 'Skip full deployment for binary-only package.'; exit 0 }
+          $candidateDirs = @(
+            (Join-Path (Join-Path 'build' 'out') $env:BUILD_CONFIG),
+            (Join-Path 'build' $env:BUILD_CONFIG),
+            (Join-Path (Join-Path 'build' 'x64') $env:BUILD_CONFIG),
+            (Join-Path (Join-Path 'build' 'bin') $env:BUILD_CONFIG)
+          ) | Where-Object { Test-Path $_ }
+          if (-not $candidateDirs) {
+            $candidateDirs = Get-ChildItem -Path build -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq $env:BUILD_CONFIG } |
+              Select-Object -ExpandProperty FullName
+          }
+          if (-not $candidateDirs) { throw "Expected Windows output directory for BUILD_CONFIG=$env:BUILD_CONFIG not found." }
+          $winBuildDir = $candidateDirs | Select-Object -First 1
+          $exe = Get-ChildItem -Recurse $winBuildDir -Filter *.exe |
+            Where-Object {
+              $_.FullName -notmatch '[\\/]CMakeFiles[\\/]' -and
+              $_.DirectoryName -notmatch 'CompilerId' -and
+              $_.BaseName -notlike 'CompilerId*'
+            } |
+            Sort-Object FullName |
+            Select-Object -First 1
+          if (-not $exe) { throw 'No application executable found for deployment.' }
+          if ($exe.FullName -notmatch ([regex]::Escape([IO.Path]::DirectorySeparatorChar + $env:BUILD_CONFIG + [IO.Path]::DirectorySeparatorChar))) {
+            throw "Selected executable does not belong to BUILD_CONFIG=$env:BUILD_CONFIG: $($exe.FullName)"
+          }
+          if ($exe) {
+            $deployMode = if ($env:BUILD_CONFIG -eq 'Debug') { '--debug' } else { '--release' }
+            windeployqt $deployMode $exe.FullName
+            "WIN_EXE_DIR=$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Deploy Qt (Linux)
+        if: matrix.target == 'linux'
+        shell: bash
+        run: |
+          if [ "$PACKAGE_MODE" != "full" ]; then echo 'Skip full deployment for binary-only package.'; exit 0; fi
+          linux_build_dir=build/out/$BUILD_CONFIG
+          [ -d "$linux_build_dir" ] || linux_build_dir=build
+          linux_exe=$(find "$linux_build_dir" -maxdepth 3 -type f -executable ! -name '*.so*' \
+            ! -path '*/CMakeFiles/*' ! -name 'CompilerId*' | head -1)
+          if [ -z "$linux_exe" ]; then
+            echo 'No Linux executable found; skipping linuxdeployqt.'
+            exit 0
+          fi
+          mkdir -p deploy/linux-appdir
+          cp "$linux_exe" deploy/linux-appdir/
+          curl -L -o linuxdeployqt.AppImage \
+            https://github.com/probonopd/linuxdeployqt/releases/download/continuous/linuxdeployqt-continuous-x86_64.AppImage
+          chmod +x linuxdeployqt.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeployqt.AppImage deploy/linux-appdir/$(basename "$linux_exe") -bundle-non-qt-libs
+          echo "LINUX_DEPLOY_DIR=$(pwd)/deploy/linux-appdir" >> "$GITHUB_ENV"
+
+      - name: Deploy Qt (macOS)
+        if: matrix.target == 'macos'
+        run: |
+          if [ "$PACKAGE_MODE" != "full" ]; then echo 'Skip full deployment for binary-only package.'; exit 0; fi
+          mac_build_dir=build/out/$BUILD_CONFIG
+          [ -d "$mac_build_dir" ] || mac_build_dir=build
+          echo '=== macOS build outputs ==='
+          find "$mac_build_dir" -maxdepth 5 \( -name '*.app' -o -type f -perm -111 \) | sed 's#^#  #'
+          app=$(find "$mac_build_dir" -name '*.app' | head -1)
+          if [ -n "$app" ]; then
+            # Update Info.plist with bundle ID and app name from project settings
+            plist="$app/Contents/Info.plist"
+            if [ -f "$plist" ]; then
+              echo '=== Updating macOS Info.plist ==='
+              if [ -n "${EQT_MACOS_BUNDLE_ID:-}" ]; then
+                /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $EQT_MACOS_BUNDLE_ID" "$plist" 2>/dev/null || \
+                /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $EQT_MACOS_BUNDLE_ID" "$plist"
+                echo "  CFBundleIdentifier: $EQT_MACOS_BUNDLE_ID"
+              fi
+              if [ -n "${EQT_MACOS_APP_NAME:-}" ]; then
+                /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $EQT_MACOS_APP_NAME" "$plist" 2>/dev/null || \
+                /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $EQT_MACOS_APP_NAME" "$plist"
+                echo "  CFBundleDisplayName: $EQT_MACOS_APP_NAME"
+              fi
+              if [ -n "${EQT_MACOS_VERSION_NAME:-}" ]; then
+                /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $EQT_MACOS_VERSION_NAME" "$plist" 2>/dev/null || \
+                /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $EQT_MACOS_VERSION_NAME" "$plist"
+                echo "  CFBundleShortVersionString: $EQT_MACOS_VERSION_NAME"
+              fi
+              if [ -n "${EQT_MACOS_VERSION_CODE:-}" ]; then
+                /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $EQT_MACOS_VERSION_CODE" "$plist" 2>/dev/null || \
+                /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $EQT_MACOS_VERSION_CODE" "$plist"
+                echo "  CFBundleVersion: $EQT_MACOS_VERSION_CODE"
+              fi
+            fi
+            "$QT_ROOT/bin/macdeployqt" "$app"
+          else
+            echo 'No .app bundle found; skipping macdeployqt.'
+          fi
+
+      - name: Deploy Qt (Android)
+        if: matrix.target == 'android'
+        shell: bash
+        run: |
+          mkdir -p dist
+          sanitize_android_manifests() {
+            for root in build deploy; do
+              [ -d "$root" ] || continue
+              find "$root" -type f -name 'AndroidManifest.xml' 2>/dev/null | while read -r manifest; do
+                python -c "import pathlib,re,sys; path=pathlib.Path(sys.argv[1]); text=path.read_text(encoding='utf-8'); updated=re.sub(r'\\s+package=\"[^\"]*\"', '', text, count=1); print(f'Sanitized package attribute in {path}') if updated != text else None; path.write_text(updated, encoding='utf-8') if updated != text else None" "$manifest"
+              done
+            done
+          }
+          sanitize_android_manifests
+          rewrite_android_deployment_settings() {
+            local settings_json="$1"
+            local pkg_dir="${EQT_ANDROID_PACKAGE_SOURCE_DIR:-android}"
+            if [ -z "$settings_json" ] || [ ! -f "$settings_json" ]; then
+              return 0
+            fi
+            if [ ! -d "$pkg_dir" ]; then
+              echo "Android package source directory not found in workspace: $pkg_dir"
+              return 0
+            fi
+            python -c "import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); pkg=pathlib.Path(sys.argv[2]).resolve(); data=json.loads(p.read_text(encoding='utf-8')); keys=['android-package-source-directory','android-package-source-dir']; changed=any(k in data for k in keys); [data.__setitem__(k, str(pkg)) for k in keys if k in data]; p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8') if changed else None" "$settings_json" "$pkg_dir"
+          }
+          echo '=== Android deployment settings candidates ==='
+          find . -type f -name '*deployment-settings*.json' | sed 's#^#  #' || true
+          echo "=== Searching for Android deployment settings ==="
+          selected_abis="${EQT_ANDROID_ABIS:-${EQT_ANDROID_PRIMARY_ABI:-arm64-v8a}}"
+          mapfile -t abi_list < <(python -c "import sys; raw=sys.argv[1]; items=[x.strip() for x in raw.split(';') if x.strip()]; print('\n'.join(items or ['arm64-v8a']))" "$selected_abis")
+          # Multi-ABI: Qt 6 can build multiple ABIs in one build if configured correctly
+          # We use primary ABI for cmake configure, but QT_ANDROID_ABIS includes all selected ABIs
+          primary_abi="${abi_list[0]}"
+          abi_count=${#abi_list[@]}
+          printf 'Selected Android ABIs (%d total):\n' "$abi_count"
+          for abi in "${abi_list[@]}"; do
+            if [ "$abi" = "$primary_abi" ]; then
+              printf '  %s (primary)\n' "$abi"
+            else
+              printf '  %s\n' "$abi"
+            fi
+          done
+          rm -f dist/*.apk dist/*.aab dist/*-unsigned.apk dist/*-aligned.apk dist/*.idsig 2>/dev/null || true
+          keystore_exists=false
+          if [ -n "${EQT_ANDROID_KEYSTORE:-}" ] && [ -n "${EQT_ANDROID_KEY_ALIAS:-}" ]; then
+            ks_file="${EQT_ANDROID_KEYSTORE}"
+            if [[ "$ks_file" != /* ]]; then
+              ks_file="$GITHUB_WORKSPACE/$ks_file"
+            fi
+            if [ -f "$ks_file" ]; then
+              keystore_exists=true
+            else
+              echo "WARNING: Keystore file not found: $EQT_ANDROID_KEYSTORE"
+            fi
+          fi
+          if [ "$keystore_exists" = false ] && [ "${EQT_ANDROID_SIGN_MODE:-debug}" = "release" ]; then
+            echo 'ERROR: Release mode requested but no usable keystore available.'
+            exit 1
+          fi
+          packaged_count=0
+          for requested_abi in "${abi_list[@]}"; do
+            current_deploy_input=$(find . -path "*/android_abi_builds/${requested_abi}/*deployment-settings*.json" | grep -v "CMakeFiles" | head -1 || true)
+            if [ -z "$current_deploy_input" ]; then
+              current_deploy_input=$(find "build_${requested_abi}" -name "*deployment-settings*.json" | grep -v "CMakeFiles" | head -1 || true)
+            fi
+            if [ -z "$current_deploy_input" ] && [ "$abi_count" -le 1 ]; then
+              current_deploy_input=$(find . -maxdepth 2 -path './build/*deployment-settings*.json' ! -path './build/android_abi_builds/*' | grep -v "CMakeFiles" | head -1 || true)
+            fi
+            if [ -z "$current_deploy_input" ] && [ "$abi_count" -le 1 ]; then
+              current_deploy_input=$(find . -name "*deployment-settings*.json" | grep -v "CMakeFiles" | head -1 || true)
+            fi
+            if [ -z "$current_deploy_input" ]; then
+              echo "ERROR: No deployment settings JSON found for ABI $requested_abi"
+              echo 'Available deployment settings:'
+              find . -type f -name '*deployment-settings*.json' | grep -v 'CMakeFiles' | sed 's#^#  #' || true
+              exit 1
+            fi
+            echo "Found deployment settings at: $current_deploy_input"
+            android_abi="$requested_abi"
+            deploy_output="deploy/android-build-${android_abi}"
+            mkdir -p "$deploy_output"
+            app_binary=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('application-binary','main'))" "$current_deploy_input")
+
+            # Create temp deployment settings with ONLY this ABI
+            temp_deploy="deploy/${android_abi}-deployment.json"
+            mkdir -p deploy
+            python3 -c "import json,sys;abi=sys.argv[2];d=json.load(open(sys.argv[1]));d['android-abis']=[abi];d['android-build-abis']=[abi];s=d.get('android-deployment-settings',{});s['android-abis']=[abi];s['android-build-abis']=[abi];d['android-deployment-settings']=s;[d.__setitem__(k,{abi:v.get(abi)}) for k,v in list(d.items()) if isinstance(v,dict) and len(v)>1 and abi in v];json.dump(d,open(sys.argv[3],'w',encoding='utf-8'),indent=2,ensure_ascii=False)" "$current_deploy_input" "$android_abi" "$temp_deploy"
+
+            # Copy only this ABI's .so
+            expected_so="$deploy_output/libs/$android_abi/lib${app_binary}_${android_abi}.so"
+            mkdir -p "$(dirname "$expected_so")"
+            # First look in the standard build directory (Qt 6 may build all ABIs there)
+            candidate_so=$(find build -path "*/$android_abi/*" -type f -name "lib${app_binary}_${android_abi}.so" ! -path '*/CMakeFiles/*' | head -1)
+            if [ -z "$candidate_so" ]; then
+              candidate_so=$(find build -type f -name "lib${app_binary}_${android_abi}.so" ! -path '*/CMakeFiles/*' | head -1)
+            fi
+            # Fallback to ABI-specific build directory
+            if [ -z "$candidate_so" ]; then
+              candidate_so=$(find "build_${android_abi}" -type f -name "lib${app_binary}_${android_abi}.so" ! -path '*/CMakeFiles/*' | head -1)
+            fi
+            if [ -n "$candidate_so" ]; then
+              cp -f "$candidate_so" "$expected_so"
+              echo "Prepared $android_abi: $candidate_so -> $expected_so"
+            else
+              echo "ERROR: Could not find lib${app_binary}_${android_abi}.so"
+              exit 1
+            fi
+            apk_output="dist/${app_binary}-${android_abi}.apk"
+            # Use the temp deployment settings that contains ONLY this ABI
+            args=(--input "$temp_deploy" --output "$deploy_output" --android-platform "android-${EQT_ANDROID_TARGET_SDK:-35}" --verbose --apk "$apk_output")
+            if [ "${EQT_ANDROID_SIGN_MODE:-debug}" = "release" ]; then
+              args+=(--release)
+            else
+              args+=(--debug)
+            fi
+            if [ "$keystore_exists" = true ]; then
+              ks_ext="${ks_file##*.}"
+              args+=(--sign "$ks_file" "$EQT_ANDROID_KEY_ALIAS" --storepass "$EQT_ANDROID_STORE_PASSWORD")
+              case "$ks_ext" in
+                p12|P12|pfx|PFX)
+                  args+=(--storetype PKCS12)
+                  if [ -n "${EQT_ANDROID_STORE_PASSWORD:-}" ]; then
+                    args+=(--keypass "$EQT_ANDROID_STORE_PASSWORD")
+                  fi
+                  ;;
+              esac
+              case "$ks_ext" in
+                p12|P12|pfx|PFX) ;;
+                *)
+                  if [ -n "${EQT_ANDROID_KEY_PASSWORD:-}" ]; then
+                    args+=(--keypass "$EQT_ANDROID_KEY_PASSWORD")
+                  fi
+                  ;;
+              esac
+            fi
+            echo "androiddeployqt args: ${args[*]}"
+            set +e
+            "$QT_HOST_PATH/bin/androiddeployqt" "${args[@]}"
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+              echo "ERROR: androiddeployqt failed with exit code $rc"
+              echo "DEBUG: deploy_output contents:"
+              find "$deploy_output" -type f 2>/dev/null | head -30 || true
+              exit $rc
+            fi
+            sanitize_android_manifests
+            rm -f dist/*-unsigned.apk dist/*-aligned.apk dist/*.idsig 2>/dev/null || true
+            if [ ! -f "$apk_output" ]; then
+              echo "ERROR: androiddeployqt did not produce package $apk_output"
+              find "$deploy_output" -type f 2>/dev/null | sed 's#^#  #' || true
+              exit 1
+            fi
+            packaged_count=$((packaged_count + 1))
+          done
+          if [ "$packaged_count" -eq 0 ]; then
+            echo 'ERROR: No Android packages were produced.'
+            exit 1
+          fi
+          echo '=== Android dist contents ==='
+          ls -la dist/ || true
+
+      - name: Collect artifacts
+        if: matrix.target != 'android'
+        shell: bash
+        run: |
+          mkdir -p dist
+          # Windows: preserve the deployed directory structure (platforms/, styles/, etc.)
+          if [ "${{ matrix.target }}" = "windows" ]; then
+            win_dir="$WIN_EXE_DIR"
+            if [ -z "$win_dir" ]; then
+              for candidate in "build/out/$BUILD_CONFIG" "build/$BUILD_CONFIG" "build/x64/$BUILD_CONFIG" "build/bin/$BUILD_CONFIG"; do
+                if [ -d "$candidate" ]; then win_dir="$candidate"; break; fi
+              done
+            fi
+            if [ -z "$win_dir" ]; then
+              win_dir=$(find build -type d -name "$BUILD_CONFIG" | head -1)
+            fi
+            if [ ! -d "$win_dir" ]; then
+              echo "Expected Windows output directory for BUILD_CONFIG=$BUILD_CONFIG not found"
+              exit 1
+            fi
+            if [ "$PACKAGE_MODE" = "full" ]; then
+              cp -R "$win_dir"/. dist/ 2>/dev/null || true
+            else
+              find "$win_dir" -maxdepth 1 -type f -name '*.exe' -exec cp {} dist/ \; 2>/dev/null || true
+            fi
+          fi
+          # Linux: executables (no extension)
+          if [ "${{ matrix.target }}" = "linux" ]; then
+            linux_dir="$LINUX_DEPLOY_DIR"
+            if [ "$PACKAGE_MODE" = "full" ] && [ -n "$linux_dir" ] && [ -d "$linux_dir" ]; then
+              cp -R "$linux_dir"/. dist/ 2>/dev/null || true
+            else
+              find build/out/$BUILD_CONFIG build -maxdepth 3 -type f -executable ! -name '*.so*' \
+                -not -path '*/CMakeFiles/*' -not -name 'CompilerId*' \
+                -exec cp {} dist/ \; 2>/dev/null || true
+            fi
+          fi
+          # macOS: .app bundles
+          if [ "${{ matrix.target }}" = "macos" ]; then
+            if [ "$PACKAGE_MODE" = "full" ]; then
+              find build/out/$BUILD_CONFIG build -name '*.app' -exec cp -R {} dist/ \; 2>/dev/null || true
+          # macOS fallback: plain executables when no .app bundle was produced
+              find build/out/$BUILD_CONFIG build -type f -perm -111 ! -name '*.dylib' ! -name '*.so*' \
+                -not -path '*/CMakeFiles/*' -not -path '*/.app/*' -not -name 'CompilerId*' \
+                -exec cp {} dist/ \; 2>/dev/null || true
+            else
+              find build/out/$BUILD_CONFIG build -maxdepth 3 -type f -perm -111 ! -name '*.dylib' ! -name '*.so*' \
+                -not -path '*/CMakeFiles/*' -not -name 'CompilerId*' \
+                -exec cp {} dist/ \; 2>/dev/null || true
+            fi
+          fi
+          echo '=== dist contents ==='
+          ls -la dist/
+          if [ -z "$(find dist -mindepth 1 -maxdepth 1 2>/dev/null | head -1)" ]; then
+            {
+              echo 'No packaged artifacts were found.'
+              echo
+              echo '=== build tree ==='
+              find build -maxdepth 6 2>/dev/null || true
+              echo
+              echo '=== deploy tree ==='
+              find deploy -maxdepth 6 2>/dev/null || true
+            } > dist/_artifact_diagnostics.txt
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 7
